@@ -1,191 +1,1001 @@
-import 'package:bluebubbles/services/backend/java_dart_interop/method_channel_service.dart';
-import 'package:flutter/services.dart';
+package com.bluebubbles.messaging.services.notifications
 
-class MethodChannelActions {
-  final MethodChannelService service;
-  MethodChannelActions(this.service);
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.graphics.BitmapFactory
+import android.os.Build
+import android.os.Bundle
+import androidx.core.app.NotificationCompat
+import androidx.core.app.Person
+import androidx.core.app.RemoteInput
+import androidx.core.graphics.drawable.IconCompat
+import com.bluebubbles.messaging.BubbleActivity
+import com.bluebubbles.messaging.Constants
+import com.bluebubbles.messaging.MainActivity
+import com.bluebubbles.messaging.R
+import com.bluebubbles.messaging.models.MethodCallHandlerImpl
+import com.bluebubbles.messaging.services.intents.InternalIntentReceiver
+import com.bluebubbles.messaging.services.system.PushShareTargetsHandler
+import com.bluebubbles.messaging.utils.Utils
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
 
-  Future<void> signalReady() async {
-    await service.invokeMethod('ready');
-  }
+class CreateIncomingMessageNotification: MethodCallHandlerImpl() {
+    companion object {
+        const val tag = "create-incoming-message-notification"
+        private val notificationLock = Any()
+    }
 
-  Future<void> openBrowser({required String? link}) async {
-    if (link == null || link.isEmpty) return;
-    await service.invokeMethod('open-browser', {'link': link});
-  }
+    override fun handleMethodCall(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        context: Context
+    ) {
+        // channel details
+        val channelId: String = call.argument("channel_id")!!
+        // chat details
+        val chatGuid: String = call.argument("chat_guid")!!
+        val chatTitle: String = call.argument("chat_title")!!
+        val chatIsGroup: Boolean = call.argument("chat_is_group")!!
+        val chatIcon: ByteArray? = call.argument("chat_icon")
+        val chatBitmap = if ((chatIcon?.size ?: 0) == 0) null else Utils.getAdaptiveIconFromByteArray(chatIcon!!)
+        // message details
+        val messageText: String = call.argument("message_text")!!
+        val messageGuid: String = call.argument("message_guid")!!
+        val messageDate: Long = call.argument("message_date")!!
+        val messageIsFromMe: Boolean = call.argument("message_is_from_me")!!
+        // contact details
+        val contactName: String = call.argument("contact_name")!!
+        val contactIcon: ByteArray? = call.argument("contact_avatar")
+        val contactBitmap = if ((contactIcon?.size ?: 0) == 0) null else Utils.getAdaptiveIconFromByteArray(contactIcon!!)
+        val notificationImage: ByteArray? = call.argument("notification_image")
+        val notificationImageBitmap = if ((notificationImage?.size ?: 0) == 0) null else BitmapFactory.decodeByteArray(notificationImage, 0, notificationImage!!.size)
+        // reaction settings
+        val showReactionAction: Boolean = call.argument("show_reaction_action") ?: false
+        val reactionType: String = call.argument("reaction_type") ?: "like"
 
-  Future<void> openContactForm({required String address, required bool isEmail}) async {
-    await service.invokeMethod('open-contact-form', {
-      'address': address,
-      'address_type': isEmail ? 'email' : 'phone',
-    });
-  }
+        // calculate a notification ID based on the chat database ID
+        val notificationId: Int = call.argument("chat_id")!!
 
-  Future<void> viewContactForm({required dynamic nativeContactId}) async {
-    await service.invokeMethod('view-contact-form', {'id': nativeContactId});
-  }
+        val notificationManager = context.getSystemService(NotificationManager::class.java)
 
-  Future<void> openCalendar({required int dateEpochMillis}) async {
-    await service.invokeMethod('open-calendar', {'date': dateEpochMillis});
-  }
+        // Synchronize to prevent duplicate notifications from concurrent calls
+        synchronized(notificationLock) {
+            // check if the message has already been posted as a notification
+            val notificationPostedAlready = notificationManager.activeNotifications.firstOrNull { it.notification.extras.getString("chatGuid") == chatGuid && it.notification.extras.getString("messageGuid") == messageGuid } != null
+            // don't double post a notification
+            if (notificationPostedAlready) return result.success(null)
+        }
 
-  Future<void> pushShareTarget({required String title, required String guid, required Uint8List icon}) async {
-    await service.invokeMethod('push-share-targets', {
-      'title': title,
-      'guid': guid,
-      'icon': icon,
-    });
-  }
+        // this is used to copy the style, since the notification already exists
+        val chatNotification = notificationManager.activeNotifications.lastOrNull { it.notification.extras.getString("chatGuid") == chatGuid && it.notification.extras.getString("channelId") == channelId }
 
-  Future<void> requestNotificationListenerPermission() async {
-    await service.invokeMethod('request-notification-listener-permission');
-  }
+        // build the sender object and push the share target again
+        val sender = Person.Builder()
+            .setName(contactName)
+            .setIcon(contactBitmap)
+            .setImportant(true)
+            .build()
+        PushShareTargetsHandler().pushShareTarget(context, chatTitle, chatGuid, chatIcon)
 
-  Future<void> startNotificationListener() async {
-    await service.invokeMethod('start-notification-listener');
-  }
+        // get or create a messaging style
+        val style = if (chatNotification != null) {
+            NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(chatNotification.notification)
+                ?: NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
+        } else {
+            NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
+        }
+        if (chatIsGroup) {
+            style.isGroupConversation = true
+            style.conversationTitle = chatTitle
+        }
+        // add the new message to the style
+        style.addMessage(NotificationCompat.MessagingStyle.Message(
+            messageText,
+            messageDate,
+            sender
+        ))
 
-  Future<void> openConversationNotificationSettings({required String channelId, required String displayName}) async {
-    await service.invokeMethod('open-conversation-notification-settings', {
-      'channel_id': channelId,
-      'display_name': displayName,
-    });
-  }
+        val notificationStyle = if (notificationImageBitmap != null) {
+            NotificationCompat.BigPictureStyle()
+                .bigPicture(notificationImageBitmap)
+                .setBigContentTitle(if (chatIsGroup) chatTitle else contactName)
+                .setSummaryText(messageText)
+        } else {
+            style
+        }
 
-  Future<void> setNextRestart({required int value}) async {
-    await service.invokeMethod('set-next-restart', {'value': value});
-  }
+        // create a bundle for extra info
+        val extras = Bundle()
+        extras.putString("chatGuid", chatGuid)
+        extras.putString("messageGuid", messageGuid)
+        extras.putString("channelId", channelId)
+        extras.putString("tag", Constants.newMessageNotificationTag)
+        extras.putBoolean("reactionSent", false) // Track if reaction has been sent
 
-  Future<void> startForegroundService() async {
-    await service.invokeMethod('start-foreground-service');
-  }
+        // intent to open the conversation in-app
+        val openConversationIntent = PendingIntent.getActivity(
+            context,
+            notificationId + Constants.pendingIntentOpenChatOffset,
+            Intent(context, MainActivity::class.java)
+                .putExtras(extras)
+                .putExtra("notificationId", notificationId)
+                .putExtra("bubble", false)
+                .setType("OpenChat"),
+            PendingIntent.FLAG_IMMUTABLE
+        )
 
-  Future<void> stopForegroundService() async {
-    await service.invokeMethod('stop-foreground-service');
-  }
+        // intent to swipe away the notification
+        val deleteNotificationIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId + Constants.pendingIntentDeleteNotificationOffset,
+            Intent(context, InternalIntentReceiver::class.java)
+                .putExtras(extras)
+                .putExtra("notificationId", notificationId)
+                .setType("DeleteNotification"),
+            PendingIntent.FLAG_IMMUTABLE
+        )
 
-  /// Asks the engine to drop its GPU, Skia/Impeller and VM caches, as it would on
-  /// a system low-memory signal. Android only; a no-op elsewhere.
-  Future<void> trimMemory() async {
-    await service.invokeMethod('trim-memory');
-  }
+        // intent and action for 'mark as read'
+        val markAsReadIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId + Constants.pendingIntentMarkReadOffset,
+            Intent(context, InternalIntentReceiver::class.java)
+                .putExtras(extras)
+                .putExtra("notificationId", notificationId)
+                .setType("MarkChatRead"),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val markAsReadAction = NotificationCompat.Action.Builder(0, "Mark As Read", markAsReadIntent)
+            .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_MARK_AS_READ)
+            .setShowsUserInterface(false)
+            .build()
 
-  /// Current process memory in KB, keyed `pss`, `graphics`, `javaHeap`, `nativeHeap`,
-  /// `code`, `privateOther`. Android only; null elsewhere or on failure.
-  Future<Map<String, int>?> memoryStats() async {
-    final raw = await service.invokeMethod('memory-stats');
-    if (raw is! Map) return null;
-    return raw.map((key, value) => MapEntry(key.toString(), value is num ? value.toInt() : 0));
-  }
+        // intent and action for quick reply
+        val replyIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId,
+            Intent(context, InternalIntentReceiver::class.java)
+                .putExtras(extras)
+                .putExtra("notificationId", notificationId)
+                .setType("ReplyChat"),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val replyAction = NotificationCompat.Action.Builder(0, "Reply", replyIntent)
+            .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
+            .setShowsUserInterface(false)
+            .setAllowGeneratedReplies(true)
+            .extend(NotificationCompat.Action.WearableExtender().setHintDisplayActionInline(true))
+            .addRemoteInput(RemoteInput.Builder("text_reply").setLabel("Reply").build())
+            .build()
 
-  Future<void> deleteNotification({required int notificationId, String? tag}) async {
-    await service.invokeMethod('delete-notification', {
-      'notification_id': notificationId,
-      'tag': ?tag,
-    });
-  }
+        // intent and action for 'like'
+        val likeIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId + 1, // offset by 1 to avoid conflicts
+            Intent(context, InternalIntentReceiver::class.java)
+                .putExtras(extras)
+                .putExtra("notificationId", notificationId)
+                .putExtra("messageText", messageText)
+                .putExtra("reactionType", reactionType)
+                .setType("LikeMessage"),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val likeActionTitle = if (reactionType == "love") "Love" else "Like"
+        val likeAction = NotificationCompat.Action.Builder(0, likeActionTitle, likeIntent)
+            .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_THUMBS_UP)
+            .setShowsUserInterface(false)
+            .build()
 
-  Future<String?> firebaseAuth({required Map<String, dynamic> fcmData}) async {
-    return await service.invokeMethod('firebase-auth', fcmData) as String?;
-  }
+        // intent for bubbling (create it even if not used, for future compatibility)
+        val bubbleIntent = PendingIntent.getActivity(
+            context,
+            notificationId + Constants.pendingIntentOpenBubbleOffset,
+            Intent(context, BubbleActivity::class.java)
+                .putExtras(extras)
+                .putExtra("notificationId", notificationId)
+                .putExtra("bubble", true)
+                .setType("OpenChat"),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
 
-  Future<void> firebaseDeleteToken() async {
-    await service.invokeMethod('firebase-delete-token');
-  }
+        // Build the notification
+        val notificationBuilder = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.mipmap.ic_stat_icon)
+            .setGroup(Constants.notificationGroupKey)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+            .setOnlyAlertOnce(messageIsFromMe)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setContentIntent(openConversationIntent)
+            .setDeleteIntent(deleteNotificationIntent)
+            .setStyle(notificationStyle)
+            .setAllowSystemGeneratedContextualActions(true)
+            .setColor(4888294)
+            .addAction(markAsReadAction)
+            .addAction(replyAction)
+            .addPerson(sender)
+            .addExtras(extras)
 
-  Future<String?> getServerUrl() async {
-    return await service.invokeMethod('get-server-url') as String?;
-  }
+        if (notificationImageBitmap != null) {
+            notificationBuilder.setContentTitle(if (chatIsGroup) chatTitle else contactName)
+            notificationBuilder.setContentText(messageText)
+            notificationBuilder.setLargeIcon(notificationImageBitmap)
+        }
 
-  Future<void> createNotificationChannel({
-    required String channelId,
-    required String channelName,
-    required String channelDescription,
-  }) async {
-    await service.invokeMethod('create-notification-channel', {
-      'channel_name': channelName,
-      'channel_description': channelDescription,
-      'channel_id': channelId,
-    });
-  }
+        // Conditionally add reaction action if enabled
+        if (showReactionAction) {
+            notificationBuilder.addAction(likeAction)
+        }
 
-  Future<void> createIncomingMessageNotification({
-    required String channelId,
-    required int? chatId,
-    required String chatGuid,
-    required bool chatIsGroup,
-    required String chatTitle,
-    required Uint8List chatIcon,
-    required String contactName,
-    required Uint8List contactAvatar,
-    required String messageGuid,
-    required String messageText,
-    required int messageDate,
-    required bool messageIsFromMe,
-    required bool showReactionAction,
-    required String reactionType,
-  }) async {
-    await service.invokeMethod('create-incoming-message-notification', {
-      'channel_id': channelId,
-      'chat_id': chatId,
-      'chat_guid': chatGuid,
-      'chat_is_group': chatIsGroup,
-      'chat_title': chatTitle,
-      'chat_icon': chatIcon,
-      'contact_name': contactName,
-      'contact_avatar': contactAvatar,
-      'message_guid': messageGuid,
-      'message_text': messageText,
-      'message_date': messageDate,
-      'message_is_from_me': messageIsFromMe,
-      'show_reaction_action': showReactionAction,
-      'reaction_type': reactionType,
-    });
-  }
+        // Build wearable extender
+        val wearableExtender = NotificationCompat.WearableExtender()
+            .addAction(markAsReadAction)
+            .addAction(replyAction)
+        if (showReactionAction) {
+            wearableExtender.addAction(likeAction)
+        }
+        notificationBuilder.extend(wearableExtender)
 
-  Future<void> createIncomingFaceTimeNotification({
-    required String channelId,
-    required int notificationId,
-    required String title,
-    required String body,
-    required Uint8List callerAvatar,
-    required String caller,
-    String? callUuid,
-  }) async {
-    await service.invokeMethod('create-incoming-facetime-notification', {
-      'channel_id': channelId,
-      'notification_id': notificationId,
-      'title': title,
-      'body': body,
-      'caller_avatar': callerAvatar,
-      'caller': caller,
-      'call_uuid': callUuid,
-    });
-  }
+        // Only set bubble metadata on Android 11+ (API 29+) where it's supported
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val bubbleMetadata = NotificationCompat.BubbleMetadata.Builder(bubbleIntent, chatBitmap ?: IconCompat.createWithResource(context, R.mipmap.ic_stat_icon))
+                .setDesiredHeight(600)
+                .setDeleteIntent(deleteNotificationIntent)
+                .build()
+            notificationBuilder.setBubbleMetadata(bubbleMetadata)
+        }
 
-  Future<String> getContentUriPath({required String uri}) async {
-    return (await service.invokeMethod('get-content-uri-path', {'uri': uri})).toString();
-  }
+        // Only set shortcut ID on API 29+ where dynamic shortcuts are better supported
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            notificationBuilder.setShortcutId(chatGuid)
+        }
 
-  Future<void> googleDuo({required String number}) async {
-    await service.invokeMethod('google-duo', {'number': number});
-  }
+        // intent to open the main app
+        val openSummaryIntent = PendingIntent.getActivity(
+            context,
+            0,
+            Intent(context, MainActivity::class.java)
+                .putExtra("chatGuid", "-1")
+                .putExtra("notificationId", 0)
+                .putExtra("bubble", false)
+                .setType("OpenSummary"),
+            PendingIntent.FLAG_IMMUTABLE
+        )
 
-  Future<void> updateUnifiedPushRegistration({required bool enabled}) async {
-    await service.invokeMethod('UnifiedPushHandler', {
-      'operation': enabled ? 'register' : 'unregister',
-    });
-  }
+        val summaryNotificationBuilder = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.mipmap.ic_stat_icon)
+            .setGroup(Constants.notificationGroupKey)
+            .setGroupSummary(true)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setContentIntent(openSummaryIntent)
+            .setColor(4888294)
 
-  Future<void> saveFileToDownloads({
-    required String filePath,
-    required String fileName,
-    required String mimeType,
-  }) async {
-    await service.invokeMethod('save-file-to-downloads', {
-      'filePath': filePath,
-      'fileName': fileName,
-      'mimeType': mimeType,
-    });
-  }
+        notificationManager.notify(Constants.newMessageNotificationTag, 0, summaryNotificationBuilder.build())
+        notificationManager.notify(Constants.newMessageNotificationTag, notificationId, notificationBuilder.build())
+        result.success(null)
+    }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+n
+
+
